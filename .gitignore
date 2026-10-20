@@ -1,0 +1,7 @@
+*.tar.gz
+*.zip
+*.db
+*.db-wal
+*.db-shm
+data/
+.DS_Store
