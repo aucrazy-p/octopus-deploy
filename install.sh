@@ -31,10 +31,11 @@ SERVICE_NAME="octopus"
 PORT_SCAN_MAX=50
 
 # ---------- 通用工具 ----------
+# _V 必须先置空再 read：Ctrl-D / EOF 时 read 不赋值，set -u 下直接读 $_V 会报 unbound
 if [ -e /dev/tty ]; then
-  _ask() { local p="$1"; read -r -p "$p" _V < /dev/tty; printf '%s' "$_V"; }
+  _ask() { local p="$1" _V=""; read -r -p "$p" _V < /dev/tty || true; printf '%s' "$_V"; }
 else
-  _ask() { local p="$1"; read -r _V; printf '%s' "$_V"; }
+  _ask() { local p="$1" _V=""; read -r _V || true; printf '%s' "$_V"; }
 fi
 info(){ echo -e "\033[32m==>\033[0m $*"; }
 warn(){ echo -e "\033[33m!!\033[0m $*"; }
@@ -49,19 +50,30 @@ need_systemd(){
     err "未检测到 systemd，本脚本依赖 systemd 托管服务"; exit 1; }
 }
 
+# 判断某个包是否已装（有些包没有同名可执行文件，比如 ca-certificates）
+has_pkg(){
+  if command -v dpkg >/dev/null 2>&1 && dpkg -s "$1" >/dev/null 2>&1; then return 0; fi
+  if command -v rpm  >/dev/null 2>&1 && rpm -q  "$1" >/dev/null 2>&1; then return 0; fi
+  return 1
+}
+
 pkg_install(){
-  for p in "$@"; do command -v "$p" >/dev/null 2>&1 || INSTALL_PKGS="$INSTALL_PKGS $p"; done
-  [ -z "${INSTALL_PKGS:-}" ] && return 0
+  local p missing=""
+  for p in "$@"; do
+    if command -v "$p" >/dev/null 2>&1 || has_pkg "$p"; then continue; fi
+    missing="$missing $p"
+  done
+  [ -n "$missing" ] || return 0
+  info "安装依赖:$missing"
   if command -v apt-get >/dev/null 2>&1; then
-    apt-get update -qq && apt-get install -y -qq $INSTALL_PKGS
+    apt-get update -qq && apt-get install -y -qq $missing
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y -q $INSTALL_PKGS
+    dnf install -y -q $missing
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y -q $INSTALL_PKGS
+    yum install -y -q $missing
   else
-    warn "无法自动安装依赖:$INSTALL_PKGS，请手动安装"; return 1
+    warn "无法自动安装依赖:$missing，请手动安装"; return 1
   fi
-  INSTALL_PKGS=""
 }
 
 detect_arch(){
@@ -238,7 +250,9 @@ fetch_binary(){
     info "直链失败，改用 API 查询资产地址 ..."
     local json
     json="$(curl -fsSL --max-time 25 "https://api.github.com/repos/$UPSTREAM/releases/latest" 2>/dev/null || true)"
-    url="$(printf '%s' "$json" | grep -o "\"browser_download_url\": *\"[^\"]*$ASSET\"" | grep -o 'https://[^"]*' | head -1)"
+    # 末尾的 || true 是必须的：set -euo pipefail 下 grep 无匹配会让整条管道返回 1，
+    # 赋值语句失败会直接把脚本静默退出（而不是走下面的空值判断）
+    url="$(printf '%s' "$json" | grep -o "\"browser_download_url\": *\"[^\"]*$ASSET\"" | grep -o 'https://[^"]*' | head -1 || true)"
     if [ -z "$url" ]; then
       err "未找到资产 $ASSET，可手动到 https://github.com/$UPSTREAM/releases 下载"
       rm -rf "$tmp"; exit 1
@@ -250,7 +264,7 @@ fetch_binary(){
   if command -v sha256sum >/dev/null 2>&1; then
     if curl -fsSL --max-time 20 "$base/SHA256SUMS" -o "$tmp/sums" 2>/dev/null; then
       local want got
-      want="$(grep -E "(^|[[:space:]/])$ASSET\$" "$tmp/sums" | awk '{print $1}' | head -1)"
+      want="$(grep -E "(^|[[:space:]/])$ASSET\$" "$tmp/sums" | awk '{print $1}' | head -1 || true)"
       got="$(sha256sum "$tmp/o.zip" | awk '{print $1}')"
       if [ -n "$want" ] && [ "$want" != "$got" ]; then
         err "SHA256 校验失败（期望 $want，实际 $got）"; rm -rf "$tmp"; exit 1
