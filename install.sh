@@ -334,29 +334,71 @@ do_install(){
   [ -f "$CONF_FILE" ] && existed=1
   load_cfg
 
-  # 先停掉自己的服务，避免把「自己的端口」误判为被别人占用
+  local want="$PORT"
+
+  local was_running=0
   if systemctl list-unit-files 2>/dev/null | grep -q "^${SERVICE_NAME}.service"; then
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+      was_running=1
+    fi
     systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+  fi
+
+  # 升级场景（已安装且服务在跑）：原端口是自己占的，不是别人，
+  # 等 stop 真正释放后应该看到空出来；只要停止后端口还在被占，
+  # 才视为有别的进程占着。
+  if [ "$existed" = "1" ] && [ "$was_running" = "1" ]; then
+    # 最多等 8 秒让旧进程退出释放端口；正常 1-2 秒内就会空出
+    local w=0
+    while [ "$w" -lt 16 ]; do
+      port_in_use "$want" || break
+      sleep 0.5; w=$((w+1))
+    done
+    if port_in_use "$want"; then
+      # 端口仍被占：检查是不是自己没退干净（pkill 兜底）
+      local owner
+      owner="$(port_owner "$want")"
+      if printf '%s' "$owner" | grep -q "$BIN"; then
+        warn "旧进程残留，强制清理后重试"
+        pkill -f "$APP_DIR/$BIN" 2>/dev/null || true
+        sleep 1
+      fi
+    fi
   fi
 
   mkdir -p "$APP_DIR" "$DATA_DIR"
 
   # ---- 端口决策 ----
-  local want="$PORT"
   if ! [[ "$want" =~ ^[0-9]+$ ]] || [ "$want" -lt 1 ] || [ "$want" -gt 65535 ]; then
     err "端口非法：$want"; exit 1
   fi
   if port_in_use "$want"; then
     local owner alt
     owner="$(port_owner "$want")"
-    warn "端口 $want 已被占用${owner:+（进程：$owner）}"
-    alt="$(pick_free_port $((want+1)) 2>/dev/null || true)"
-    if [ -z "$alt" ]; then
-      err "从 $want 起连续 $PORT_SCAN_MAX 个端口都不可用，请手动指定 PORT=xxxx"
-      exit 1
+    # 如果是自己没退干净（可能性已很低），不算被占用
+    if printf '%s' "$owner" | grep -q "$BIN"; then
+      pkill -f "$APP_DIR/$BIN" 2>/dev/null || true
+      sleep 1
+      # 再探一次，空了就接着用原端口
+      if ! port_in_use "$want"; then
+        PORT="$want"
+      else
+        warn "端口 $want 仍被自身进程占用，自动换端口"
+        alt="$(pick_free_port $((want+1)) 2>/dev/null || true)"
+        [ -n "$alt" ] || { err "找不到空闲端口，请手动指定 PORT=xxxx"; exit 1; }
+        warn "已自动改用空闲端口 $alt"
+        PORT="$alt"
+      fi
+    else
+      warn "端口 $want 已被占用${owner:+（进程：$owner）}"
+      alt="$(pick_free_port $((want+1)) 2>/dev/null || true)"
+      if [ -z "$alt" ]; then
+        err "从 $want 起连续 $PORT_SCAN_MAX 个端口都不可用，请手动指定 PORT=xxxx"
+        exit 1
+      fi
+      warn "已自动改用空闲端口 $alt"
+      PORT="$alt"
     fi
-    warn "已自动改用空闲端口 $alt"
-    PORT="$alt"
   else
     PORT="$want"
     if [ "$existed" = "0" ]; then
