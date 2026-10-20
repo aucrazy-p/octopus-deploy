@@ -150,29 +150,29 @@ show_addr(){
 
 # ---------- 安装 ----------
 fetch_binary(){
-  info "查询最新 release ..."
-  local api="https://api.github.com/repos/$UPSTREAM/releases/latest"
-  local json ver url tmp
-  json="$(curl -fsSL --max-time 25 "$api" 2>/dev/null || true)"
-  ver="$(printf '%s' "$json" | grep -o '"tag_name" *: *"[^"]*"' | cut -d'"' -f4)"
-  url="$(printf '%s' "$json" | grep -o "\"browser_download_url\": *\"[^\"]*$ASSET\"" | grep -o 'https://[^"]*' | head -1)"
-  if [ -z "$url" ]; then
-    err "未找到资产 $ASSET（可能被限流，或该版本未提供此架构）"
-    err "可手动到 https://github.com/$UPSTREAM/releases 下载后放到 $APP_DIR/$BIN"
-    exit 1
+  local base="https://github.com/$UPSTREAM/releases/latest/download"
+  local url="$base/$ASSET"
+  local tmp; tmp="$(mktemp -d)"
+
+  info "下载 $ASSET ..."
+  if ! curl -fL --max-time 300 --retry 2 "$url" -o "$tmp/o.zip" 2>/dev/null; then
+    # 直链失败时退回 API 查资产地址（受 60 次/小时限流，仅作兜底）
+    info "直链失败，改用 API 查询资产地址 ..."
+    local json
+    json="$(curl -fsSL --max-time 25 "https://api.github.com/repos/$UPSTREAM/releases/latest" 2>/dev/null || true)"
+    url="$(printf '%s' "$json" | grep -o "\"browser_download_url\": *\"[^\"]*$ASSET\"" | grep -o 'https://[^"]*' | head -1)"
+    if [ -z "$url" ]; then
+      err "未找到资产 $ASSET，可手动到 https://github.com/$UPSTREAM/releases 下载"
+      rm -rf "$tmp"; exit 1
+    fi
+    curl -fL --max-time 300 "$url" -o "$tmp/o.zip" || { err "下载失败"; rm -rf "$tmp"; exit 1; }
   fi
-  info "版本 $ver → $ASSET"
 
-  tmp="$(mktemp -d)"
-  curl -fL --max-time 300 "$url" -o "$tmp/o.zip"
-
-  # 校验和（拿得到就校验，拿不到不阻断）
-  local sums
-  sums="$(printf '%s' "$json" | grep -o "\"browser_download_url\": *\"[^\"]*SHA256SUMS[^\"]*\"" | grep -o 'https://[^"]*' | head -1)"
-  if [ -n "$sums" ] && command -v sha256sum >/dev/null 2>&1; then
-    if curl -fsSL --max-time 20 "$sums" -o "$tmp/sums" 2>/dev/null; then
+  # 校验和：拿得到就校验，拿不到不阻断
+  if command -v sha256sum >/dev/null 2>&1; then
+    if curl -fsSL --max-time 20 "$base/SHA256SUMS" -o "$tmp/sums" 2>/dev/null; then
       local want got
-      want="$(grep -E "(^|/)$ASSET\b" "$tmp/sums" | awk '{print $1}' | head -1)"
+      want="$(grep -E "(^|[[:space:]/])$ASSET\$" "$tmp/sums" | awk '{print $1}' | head -1)"
       got="$(sha256sum "$tmp/o.zip" | awk '{print $1}')"
       if [ -n "$want" ] && [ "$want" != "$got" ]; then
         err "SHA256 校验失败（期望 $want，实际 $got）"; rm -rf "$tmp"; exit 1
