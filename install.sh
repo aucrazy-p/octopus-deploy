@@ -159,17 +159,39 @@ guard_default_password(){
 
 # ---------- 配置 ----------
 load_cfg(){
-  [ -f "$CONF_FILE" ] && . "$CONF_FILE"
-  # 配置里没有端口时给一个随机高位端口；PORT 一旦赋值，本次运行内不再变化
+  # 绝不 source 配置文件：里面含用户手输的域名，source 会把
+  # 值里的 $(...)/反引号当命令执行。改为纯文本解析，值永远只是字符串。
+  if [ -f "$CONF_FILE" ]; then
+    local line k v
+    while IFS= read -r line || [ -n "$line" ]; do
+      line="${line%$'\r'}"
+      case "$line" in ''|'#'*) continue ;; esac
+      k="${line%%=*}"
+      v="${line#*=}"
+      # 去掉写入时可能带的成对单引号
+      case "$v" in
+        \'*\') v="${v#\'}"; v="${v%\'}";;
+      esac
+      case "$k" in
+        PORT)   [ -n "$v" ] && PORT="$v" ;;
+        DOMAIN) DOMAIN="$v" ;;
+      esac
+    done < "$CONF_FILE"
+  fi
+  # 端口必须是纯数字，防止被改坏后带去 systemd
+  case "${PORT:-}" in ''|*[!0-9]*) PORT="" ;; esac
+  # 配置里没有可用端口时给一个随机高位端口；PORT 一旦赋值，本次运行内不再变化
   [ -n "${PORT:-}" ] || PORT="$(gen_port)"
   DOMAIN="${DOMAIN:-}"
 }
 
 save_cfg(){
-  cat > "$CONF_FILE" <<EOF
-PORT=$PORT
-DOMAIN=${DOMAIN:-}
-EOF
+  # 值统一用单引号包裹并转义内部的单引号：即便有人手动 source 这个文件，
+  # 内容也只是字面量，不会被执行。
+  {
+    printf 'PORT=%s\n' "${PORT:-}"
+    printf "DOMAIN='%s'\n" "$(printf '%s' "${DOMAIN:-}" | sed "s/'/'\\\\''/g")"
+  } > "$CONF_FILE"
   chmod 600 "$CONF_FILE"
 }
 
@@ -449,6 +471,11 @@ do_setup_caddy(){
   guard_default_password "$PORT" || return 0
   local d; d="$(_ask "对外访问域名（留空取消；需已解析到本机）: ")"
   [ -z "$d" ] && { warn "已取消"; return; }
+  # 只允许合法域名字符集，同时挡住 $(...)、反引号、空格等一切注入形态
+  if ! printf '%s' "$d" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$'; then
+    err "域名格式非法：只允许字母、数字、点、连字符"
+    return 1
+  fi
   DOMAIN="$d"; save_cfg
   if ! command -v caddy >/dev/null 2>&1; then
     info "安装 Caddy ..."

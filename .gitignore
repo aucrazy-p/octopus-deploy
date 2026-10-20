@@ -5,3 +5,4 @@
 *.db-shm
 data/
 .DS_Store
+.tmp-audit/
