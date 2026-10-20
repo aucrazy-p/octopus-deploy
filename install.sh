@@ -12,9 +12,12 @@
 #
 # 说明：
 #   - 安装 upstream 官方预编译二进制（bestruirui/octopus），不依赖 Docker
-#   - 端口占用自动检测：默认 8080，被占用时自动向上找空闲端口
+#   - 端口：默认随机取 30000-59999 的高位端口（避开 8080 这类被全网重点扫描的端口），
+#     被占用时自动向上找空闲端口；也可用 PORT=xxxx 指定
 #   - 数据目录 /opt/octopus/data，备份/升级都不会碰它
 #   - 交互读取统一走 /dev/tty，解决 curl|bash 场景下菜单无输入的问题
+#   - 对外开放（setup-caddy 等）前会检测后台是否还是默认密码 admin/admin，是则拒绝，
+#     避免把管理后台以出厂密码直接暴露到公网
 
 set -euo pipefail
 
@@ -76,6 +79,13 @@ detect_arch(){
   esac
 }
 
+# 生成 30000-59999 的随机端口。
+# 目的不是安全边界，而是躲开扫描器的靶场：8080/8000/3000 这些是全网扫描常客，
+# 五位数随机端口的命中概率低两三个数量级，能挡掉绝大多数无差别扫段。
+gen_port(){
+  printf '%s' $(( 30000 + RANDOM % 30000 ))
+}
+
 # ---------- 端口检测 ----------
 port_in_use(){
   local p="$1"
@@ -103,7 +113,7 @@ port_owner(){
 
 # 从 START 向上找第一个空闲端口；找不到返回 1
 pick_free_port(){
-  local p="${1:-8080}" n=0
+  local p="${1:-$(gen_port)}" n=0
   while [ "$n" -lt "$PORT_SCAN_MAX" ]; do
     [ "$p" -gt 65535 ] && return 1
     port_in_use "$p" || { echo "$p"; return 0; }
@@ -112,10 +122,46 @@ pick_free_port(){
   return 1
 }
 
+# ---------- 默认密码检测 ----------
+# 用真实登录请求判定：密码正确返回 {"code":200,...}，错误返回 401。
+# 注意走 localhost，只看服务端实际行为，不去解析数据库里的哈希。
+is_default_password(){
+  local p="${1:-${PORT:-}}" body
+  [ -n "$p" ] || return 1
+  body="$(curl -s -m 6 -X POST "http://127.0.0.1:$p/api/v1/user/login" \
+          -H 'content-type: application/json' \
+          -d '{"username":"admin","password":"admin"}' 2>/dev/null || true)"
+  printf '%s' "$body" | grep -q '"code":200'
+}
+
+# 对外开放前的闸门：仍是出厂密码就拦住
+guard_default_password(){
+  # 注意：这里不要再写 local p="$1" port="$p"，
+  # bash 的 local 会先把右侧全部展开再统一赋值，$p 会读到外层同名变量，
+  # 导致检测的端口和提示的端口对不上。只用一个变量。
+  local port="${1:-${PORT:-}}"
+  if ! port_in_use "$port"; then
+    err "端口 $port 没有监听，服务未运行，无法确认密码状态"
+    warn "请先执行：bash $0 install   或   bash $0 start"
+    return 1
+  fi
+  if is_default_password "$port"; then
+    echo
+    err "拒绝操作：后台密码仍是出厂默认 admin/admin"
+    warn "服务监听 0.0.0.0:$port，一旦对外开放，任何人都能登录后台"
+    warn "接管你的全部渠道、上游 Key 与对话记录"
+    warn "请先改密码：bash $0 passwd    （或在菜单选 8）"
+    echo
+    return 1
+  fi
+  return 0
+}
+
 # ---------- 配置 ----------
 load_cfg(){
   [ -f "$CONF_FILE" ] && . "$CONF_FILE"
-  PORT="${PORT:-8080}"
+  # 配置里没有端口时给一个随机高位端口；PORT 一旦赋值，本次运行内不再变化
+  [ -n "${PORT:-}" ] || PORT="$(gen_port)"
   DOMAIN="${DOMAIN:-}"
 }
 
@@ -140,10 +186,20 @@ service_addr(){
 
 show_addr(){
   load_cfg
+  local pwline
+  if port_in_use "$PORT"; then
+    if is_default_password "$PORT"; then
+      pwline=" 账号：admin / admin   ← 仍是默认密码，公网暴露前必须修改"
+    else
+      pwline=" 账号：admin / 你设置的密码"
+    fi
+  else
+    pwline=" 账号：admin   （服务未运行，密码状态未知）"
+  fi
   echo
   echo "========================================================="
   echo " Octopus 管理后台：$(service_addr)"
-  echo " 默认账号：admin / admin   ← 首次登录请立刻改密码"
+  echo "$pwline"
   echo " 客户端 base_url：$(service_addr)/v1"
   echo "========================================================="
 }
@@ -250,7 +306,7 @@ do_install(){
   mkdir -p "$APP_DIR" "$DATA_DIR"
 
   # ---- 端口决策 ----
-  local want="${PORT:-8080}"
+  local want="$PORT"
   if ! [[ "$want" =~ ^[0-9]+$ ]] || [ "$want" -lt 1 ] || [ "$want" -gt 65535 ]; then
     err "端口非法：$want"; exit 1
   fi
@@ -267,7 +323,11 @@ do_install(){
     PORT="$alt"
   else
     PORT="$want"
-    info "端口 $PORT 可用"
+    if [ "$existed" = "0" ]; then
+      info "端口 $PORT 可用（随机高位端口，降低被全网扫描命中的概率）"
+    else
+      info "端口 $PORT 可用"
+    fi
   fi
   save_cfg
 
@@ -293,9 +353,19 @@ do_install(){
   if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet ufw 2>/dev/null; then
     info "检测到 ufw，如需外网访问请执行：ufw allow $PORT/tcp"
   fi
-  warn "云厂商安全组也需要放行 $PORT 端口"
+  warn "云厂商安全组需放行 $PORT/tcp，否则外网连不上"
 
   show_addr
+
+  if is_default_password "$PORT"; then
+    echo
+    warn "================== 安全提醒 =================="
+    warn "后台仍是出厂密码 admin/admin，而服务监听 0.0.0.0:$PORT"
+    warn "只要安全组放行这个端口，任何人都能登录后台接管渠道与 Key"
+    warn "立刻改密码：  bash $0 passwd        （或菜单选 8）"
+    warn "再在后台「API 密钥」建一个下游 Key，客户端用这个 Key 访问"
+    warn "=============================================="
+  fi
 }
 
 # ---------- 动作 ----------
@@ -374,6 +444,9 @@ do_change_port(){
 do_setup_caddy(){
   need_root
   load_cfg
+  # 对公网之前必须先确认后台密码不再是出厂值
+  # 用 `|| return 0`：被拦下属于正常流程，不要让 set -e 把菜单一起带退出
+  guard_default_password "$PORT" || return 0
   local d; d="$(_ask "对外访问域名（留空取消；需已解析到本机）: ")"
   [ -z "$d" ] && { warn "已取消"; return; }
   DOMAIN="$d"; save_cfg
