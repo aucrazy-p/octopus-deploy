@@ -439,11 +439,36 @@ do_logs(){
   fi
 }
 
+# 隐藏回显读一行（用于输密码）
+_read_secret(){
+  local p="$1" v=""
+  if [ -e /dev/tty ]; then
+    read -r -s -p "$p" v < /dev/tty || true
+  else
+    read -r -s v || true
+  fi
+  echo >&2
+  printf '%s' "$v"
+}
+
 do_passwd(){
   need_root
   [ -x "$APP_DIR/$BIN" ] || { err "未安装"; return; }
-  info "按提示输入新密码（读的是 $DATA_DIR 下的数据库）"
-  ( cd "$APP_DIR" && "./$BIN" passwd )
+  # upstream 的 passwd 不接受交互输入，密码必须作为参数传：octopus passwd <password>
+  local pw1 pw2
+  info "修改后台 admin 密码（数据库：$DATA_DIR）"
+  pw1="$(_read_secret '新密码（输入不回显）: ')"
+  [ -n "$pw1" ] || { err "密码不能为空"; return; }
+  [ "${#pw1}" -ge 6 ] || { err "密码至少 6 位"; return; }
+  pw2="$(_read_secret '再输入一次: ')"
+  [ "$pw1" = "$pw2" ] || { err "两次输入不一致，已取消"; return; }
+  # `--` 收尾：密码以 - 开头时也不会被当成 flag
+  if ( cd "$APP_DIR" && "./$BIN" passwd --config "$DATA_DIR/config.json" -- "$pw1" ); then
+    info "密码已更新（账号仍是 admin，立即生效，无需重启）"
+  else
+    err "修改失败，请查看上面的输出；也可手动执行：cd $APP_DIR && ./$BIN passwd <新密码>"
+    return 1
+  fi
 }
 
 do_change_port(){
