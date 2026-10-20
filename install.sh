@@ -405,15 +405,58 @@ do_install(){
 }
 
 # ---------- 动作 ----------
+# 卸载：数据要不要一起删，由用户当场决定。
+# PURGE=1 强制删干净，PURGE=0 强制保留（用于非交互/批量）。
 do_uninstall(){
   need_root
   load_cfg
+
+  local purge="${PURGE:-}" sz=""
+  # 没有可交互终端时不能靠"回车=删光"，默认保守保留，除非显式 PURGE=1
+  if [ -z "$purge" ] && [ ! -e /dev/tty ]; then
+    purge=0
+    warn "当前没有交互终端，默认保留数据；要删干净请用 PURGE=1 或 uninstall --purge"
+  fi
+  if [ -z "$purge" ]; then
+    if [ ! -d "$APP_DIR" ] && [ ! -f "$CONF_FILE" ]; then
+      purge=1
+    else
+      [ -d "$APP_DIR" ] && sz="$(du -sh "$APP_DIR" 2>/dev/null | awk '{print $1}' || true)"
+      echo
+      warn "即将卸载 Octopus：停止并删除服务、程序文件"
+      if [ -d "$DATA_DIR" ]; then
+        warn "  数据目录  $DATA_DIR  ${sz:+（$sz）}"
+        warn "            含后台密码、渠道配置、上游 Key、对话记录"
+      fi
+      if [ -f "$CONF_FILE" ]; then
+        warn "  配置文件  $CONF_FILE  （端口/域名）"
+      fi
+      local ans; ans="$(_ask "是否连数据与配置一起删除（不可恢复）？[Y/n]: ")"
+      case "$ans" in
+        n|N|no|No|NO) purge=0 ;;
+        *)            purge=1 ;;
+      esac
+    fi
+  fi
+
   systemctl disable --now "$SERVICE_NAME" 2>/dev/null || true
   rm -f "$SERVICE_FILE"; systemctl daemon-reload 2>/dev/null || true
+  systemctl reset-failed "$SERVICE_NAME" 2>/dev/null || true
   pkill -f "$APP_DIR/$BIN" 2>/dev/null || true
   rm -f "$APP_DIR/$BIN"
-  warn "已卸载程序与服务；数据保留在 $DATA_DIR（确认不需要可手动删除）"
-  warn "配置文件保留：$CONF_FILE"
+
+  if [ "$purge" = "1" ]; then
+    rm -rf "$APP_DIR"
+    rm -f "$CONF_FILE"
+    info "已彻底卸载：程序、服务、数据目录、配置文件均已删除"
+    if [ -f /etc/caddy/Caddyfile ] && grep -q "127.0.0.1:" /etc/caddy/Caddyfile 2>/dev/null; then
+      warn "如曾用菜单 9 配置过 HTTPS 反代，/etc/caddy/Caddyfile 里的站点块需手动清理"
+    fi
+  else
+    warn "已卸载程序与服务；数据保留在 $DATA_DIR"
+    warn "配置文件保留：$CONF_FILE"
+    warn "要彻底清理：rm -rf $APP_DIR $CONF_FILE"
+  fi
 }
 
 do_start(){   need_root; systemctl start "$SERVICE_NAME" && info "已启动"; show_addr; }
@@ -607,7 +650,12 @@ show_menu(){
 # ---------- 入口 ----------
 case "${1:-}" in
   install|update) do_install ;;
-  uninstall)      do_uninstall ;;
+  uninstall)
+    case "${2:-}" in
+      --purge|--all) PURGE=1 ;;
+      --keep)        PURGE=0 ;;
+    esac
+    do_uninstall ;;
   start)          do_start ;;
   stop)           do_stop ;;
   restart)        do_restart ;;

@@ -47,7 +47,7 @@ curl -fsSL https://raw.githubusercontent.com/aucrazy-p/octopus-deploy/main/insta
 | 命令 | 作用 |
 |---|---|
 | `install` / `update` | 安装或升级（数据目录保留） |
-| `uninstall` | 卸载程序与服务，数据保留 |
+| `uninstall` | 卸载服务与程序，并询问是否连数据一起删除（详见下） |
 | `start` / `stop` / `restart` | 服务控制 |
 | `status` | 服务状态 + 端口监听情况 |
 | `logs` | 最近 100 行日志 |
@@ -131,6 +131,31 @@ bash install.sh backup          # 备份到 /root/octopus-data-<时间>.tar.gz
 ```
 
 升级只需重跑 `install`：会拉最新 release、替换二进制、重启服务，`data/` 原样保留。
+
+## 卸载
+
+菜单第 12 项或 `bash install.sh uninstall`。执行前会先列出要删的东西：
+
+```
+!! 即将卸载 Octopus：停止并删除服务、程序文件
+!!   数据目录  /opt/octopus/data  （12M）
+!!            含后台密码、渠道配置、上游 Key、对话记录
+!!   配置文件  /etc/octopus-deploy.conf  （端口/域名）
+是否连数据与配置一起删除（不可恢复）？[Y/n]:
+```
+
+- **直接回车 / 输 y** → 连 `/opt/octopus`（含 `data/`）和 `/etc/octopus-deploy.conf` 一起删掉，服务器上不留残留
+- **输 n** → 只删程序和服务，数据与配置保留，屏幕会打印彻底清理用的 `rm -rf` 命令
+
+非交互场景可以显式指定，不走提问：
+
+```bash
+bash install.sh uninstall --purge   # 全删（等价 PURGE=1）
+bash install.sh uninstall --keep    # 保留数据（等价 PURGE=0）
+```
+
+> 没有可交互终端时（cron / 管道），脚本默认**保留**数据，避免误删。
+> 如果曾用菜单 9 配过 HTTPS 反代，`/etc/caddy/Caddyfile` 里的站点块不会被自动删掉，需要手动清理。
 
 ## 说明
 
